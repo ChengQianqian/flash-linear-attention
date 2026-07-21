@@ -129,6 +129,7 @@ def _npu_bwd_tile_config(
 @triton.heuristics({
     'HAS_WEIGHT': lambda args: args['weight'] is not None,
     'HAS_BIAS': lambda args: args['bias'] is not None,
+    'HAS_RESIDUAL': lambda args: args['residual'] is not None,
     'USE_INITIAL_STATE': lambda args: args['initial_state'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
@@ -138,6 +139,7 @@ def causal_conv1d_fwd_kernel(
     y,
     weight,
     bias,
+    residual,
     cu_seqlens,
     initial_state,
     chunk_indices,
@@ -146,76 +148,104 @@ def causal_conv1d_fwd_kernel(
     stride_x_n,
     stride_x_t,
     stride_x_d,
-    stride_y_n,
-    stride_y_t,
-    stride_y_d,
     D: tl.constexpr,
     W: tl.constexpr,
     BT: tl.constexpr,
     BW: tl.constexpr,
     BD: tl.constexpr,
+    NT: tl.constexpr,
+    NT_GRID: tl.constexpr,
+    MAX_NT_PER_BLOCK: tl.constexpr,
+    NT_GRID_OFFSET: tl.constexpr,
+    ACTIVATION: tl.constexpr,
     HAS_WEIGHT: tl.constexpr,
     HAS_BIAS: tl.constexpr,
+    HAS_RESIDUAL: tl.constexpr,
     USE_INITIAL_STATE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
-    CHUNK_OFFSET: tl.constexpr,
 ):
-    i_d, i_t, i_b = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    # Ported from ant_AReaL: block_ptr (coalesced loads) + fused bias/silu/residual,
+    # with MAX_NT_PER_BLOCK T-chunks per program to shrink the grid. The host launches the
+    # NT_GRID axis in chunks (NT_GRID_OFFSET) so the grid product stays under the 65535
+    # Ascend cap. Masked scalar loads are kept only for the initial_state head edge.
+    i_d, i_t_base, i_b = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    i_t_base = i_t_base + NT_GRID_OFFSET
 
     if IS_VARLEN:
-        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
-        T = eos - bos
-        p_x = x + bos * stride_x_t
-        p_y = y + bos * stride_y_t
+        i_n_base = tl.load(chunk_indices + i_t_base * MAX_NT_PER_BLOCK * 2).to(tl.int32)
     else:
-        i_n = i_b
-        i_t = i_t + CHUNK_OFFSET
-        bos = (i_b * T).to(tl.int64)
-        p_x = x + tl.cast(i_b, tl.int64) * stride_x_n
-        p_y = y + tl.cast(i_b, tl.int64) * stride_y_n
+        i_n_base = i_b
+        bos_base, eos_base = (i_b * T).to(tl.int64), (i_b * T + T).to(tl.int64)
 
     o_d = i_d * BD + tl.arange(0, BD)
-    o_w = tl.arange(0, BW) + W - BW
+    o_w = tl.arange(0, BW)
     m_d = o_d < D
-    m_w = o_w >= 0
+    m_w = o_w < W
 
     if HAS_WEIGHT:
         b_w = tl.load(weight + o_d[:, None] * W + o_w, mask=m_d[:, None] & m_w, other=0).to(tl.float32)
 
-    o_t = i_t * BT + tl.arange(0, BT)
-    m_t = (o_t >= 0) & (o_t < T)
-    b_y = tl.zeros((BT, BD), dtype=tl.float32)
+    for i_t_iter in tl.static_range(0, MAX_NT_PER_BLOCK):
+        i_t_global = i_t_base * MAX_NT_PER_BLOCK + i_t_iter
+        if i_t_global < NT:
+            if IS_VARLEN:
+                i_n, i_t = tl.load(chunk_indices + i_t_global * 2).to(tl.int32), tl.load(chunk_indices +
+                                                                                         i_t_global * 2 + 1).to(tl.int32)
+                bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
+                T_local = eos - bos
+                p_x = x + bos * stride_x_t
+            else:
+                i_n = i_n_base
+                i_t = i_t_global
+                bos, eos = bos_base, eos_base
+                T_local = T
+                p_x = x + i_b * stride_x_n
 
-    for i_w in tl.static_range(-W + 1, 1):
-        o_x = o_t + i_w
-        m_x = ((o_x >= 0) & (o_x < T))[:, None] & m_d[None, :]
-        b_yi = tl.load(
-            p_x + o_x[:, None] * stride_x_t + o_d[None, :] * stride_x_d,
-            mask=m_x,
-            other=0,
-        ).to(tl.float32)
+            b_y = tl.zeros((BT, BD), dtype=tl.float32)
+            if not USE_INITIAL_STATE or i_t * BT >= W:
+                for i_w in tl.static_range(W):
+                    p_yi = tl.make_block_ptr(p_x, (T_local, D), (stride_x_t, stride_x_d),
+                                             (i_t * BT + i_w - W + 1, i_d * BD), (BT, BD), (1, 0))
+                    b_yi = tl.load(p_yi, boundary_check=(0, 1)).to(tl.float32)
+                    if HAS_WEIGHT:
+                        b_yi *= tl.sum(b_w * (o_w == i_w), 1)
+                    b_y += b_yi
+            else:
+                o_t = i_t * BT + tl.arange(0, BT)
+                for i_w in tl.static_range(W):
+                    o_x = o_t + i_w - W + 1
+                    # Explicit 2D ([None, :]) indexing throughout: triton-ascend miscompiles
+                    # the implicit 1D-vs-2D broadcast (o_d / m_d against o_x[:, None]) in
+                    # these scalar pointer loads, faulting the vector core at runtime.
+                    m_x = ((o_x >= 0) & (o_x < T_local))[:, None] & m_d[None, :]
+                    m_c = ((o_x + W >= 0) & (o_x < 0))[:, None] & m_d[None, :]
+                    b_yi = tl.load(
+                        p_x + o_x[:, None] * stride_x_t + o_d[None, :] * stride_x_d,
+                        mask=m_x,
+                        other=0,
+                    ).to(tl.float32)
+                    # Guard with a pure-constexpr check: triton-ascend does not fold the
+                    # outer `not USE_INITIAL_STATE or <runtime>`, so this else branch is
+                    # lowered even when initial_state is None -- without the guard it would
+                    # dereference None at compile time (AttributeError on None.type).
+                    if USE_INITIAL_STATE:
+                        b_yi += tl.load(initial_state + i_n * D * W + o_d[None, :] * W + (o_x + W)
+                                        [:, None], mask=m_c, other=0).to(tl.float32)
+                    if HAS_WEIGHT:
+                        b_yi *= tl.sum(b_w * (o_w == i_w), 1)[None, :]
+                    b_y += b_yi
 
-        if USE_INITIAL_STATE:
-            m_c = ((o_x + W >= 0) & (o_x < 0))[:, None] & m_d[None, :]
-            b_yi += tl.load(
-                initial_state + i_n * D * W + o_d[None, :] * W + (o_x + W)[:, None],
-                mask=m_c,
-                other=0,
-            ).to(tl.float32)
+            if HAS_BIAS:
+                b_y += tl.load(bias + o_d, mask=m_d).to(tl.float32)
+            if ACTIVATION == 'swish' or ACTIVATION == 'silu':
+                b_y = b_y * tl.sigmoid(b_y)
+            if HAS_RESIDUAL:
+                p_residual = tl.make_block_ptr(residual + bos * D, (T_local, D), (D, 1),
+                                               (i_t * BT, i_d * BD), (BT, BD), (1, 0))
+                b_y += tl.load(p_residual, boundary_check=(0, 1))
 
-        if HAS_WEIGHT:
-            b_yi = b_yi * tl.sum(b_w * (o_w == (i_w + W - 1)), 1)[None, :]
-        b_y += b_yi
-
-    if HAS_BIAS:
-        b_y += tl.load(bias + o_d, mask=m_d).to(tl.float32)[None, :]
-
-    tl.store(
-        p_y + o_t[:, None] * stride_y_t + o_d[None, :] * stride_y_d,
-        tl.cast(b_y, dtype=y.dtype.element_ty, fp_downcast_rounding='rtne'),
-        mask=m_t[:, None] & m_d[None, :],
-    )
+            p_y = tl.make_block_ptr(y + bos * D, (T_local, D), (D, 1), (i_t * BT, i_d * BD), (BT, BD), (1, 0))
+            tl.store(p_y, tl.cast(b_y, dtype=p_y.dtype.element_ty, fp_downcast_rounding='rtne'), boundary_check=(0, 1))
 
 
 @triton.jit
@@ -973,22 +1003,128 @@ def _postprocess_update(
     return y
 
 
-def _launch_fwd_core(
+@triton.heuristics({
+    'HAS_WEIGHT': lambda args: args['weight'] is not None,
+    'HAS_BIAS': lambda args: args['bias'] is not None,
+    'USE_INITIAL_STATE': lambda args: args['initial_state'] is not None,
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
+})
+@triton.jit
+def causal_conv1d_fwd_kernel_scalar(
+    x,
+    y,
+    weight,
+    bias,
+    cu_seqlens,
+    initial_state,
+    chunk_indices,
+    B,
+    T,
+    stride_x_n,
+    stride_x_t,
+    stride_x_d,
+    stride_y_n,
+    stride_y_t,
+    stride_y_d,
+    D: tl.constexpr,
+    W: tl.constexpr,
+    BT: tl.constexpr,
+    BW: tl.constexpr,
+    BD: tl.constexpr,
+    HAS_WEIGHT: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    USE_INITIAL_STATE: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+    CHUNK_OFFSET: tl.constexpr,
+):
+    # Scalar (masked-load) forward -- the proven triton-ascend path. Used when
+    # initial_state is present: the ant_AReaL block_ptr kernel's initial_state head-edge
+    # branch faults the Ascend vector core on this triton-ascend version, so we fall back
+    # to this simpler control flow which compiles+runs cleanly.
+    i_d, i_t, i_b = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+
+    if IS_VARLEN:
+        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
+        T = eos - bos
+        p_x = x + bos * stride_x_t
+        p_y = y + bos * stride_y_t
+    else:
+        i_n = i_b
+        i_t = i_t + CHUNK_OFFSET
+        bos = (i_b * T).to(tl.int64)
+        p_x = x + tl.cast(i_b, tl.int64) * stride_x_n
+        p_y = y + tl.cast(i_b, tl.int64) * stride_y_n
+
+    o_d = i_d * BD + tl.arange(0, BD)
+    o_w = tl.arange(0, BW) + W - BW
+    m_d = o_d < D
+    m_w = o_w >= 0
+
+    if HAS_WEIGHT:
+        b_w = tl.load(weight + o_d[:, None] * W + o_w, mask=m_d[:, None] & m_w, other=0).to(tl.float32)
+
+    o_t = i_t * BT + tl.arange(0, BT)
+    m_t = (o_t >= 0) & (o_t < T)
+    b_y = tl.zeros((BT, BD), dtype=tl.float32)
+
+    for i_w in tl.static_range(-W + 1, 1):
+        o_x = o_t + i_w
+        m_x = ((o_x >= 0) & (o_x < T))[:, None] & m_d[None, :]
+        b_yi = tl.load(
+            p_x + o_x[:, None] * stride_x_t + o_d[None, :] * stride_x_d,
+            mask=m_x,
+            other=0,
+        ).to(tl.float32)
+
+        if USE_INITIAL_STATE:
+            m_c = ((o_x + W >= 0) & (o_x < 0))[:, None] & m_d[None, :]
+            b_yi += tl.load(
+                initial_state + i_n * D * W + o_d[None, :] * W + (o_x + W)[:, None],
+                mask=m_c,
+                other=0,
+            ).to(tl.float32)
+
+        if HAS_WEIGHT:
+            b_yi = b_yi * tl.sum(b_w * (o_w == (i_w + W - 1)), 1)[None, :]
+        b_y += b_yi
+
+    if HAS_BIAS:
+        b_y += tl.load(bias + o_d, mask=m_d).to(tl.float32)[None, :]
+
+    tl.store(
+        p_y + o_t[:, None] * stride_y_t + o_d[None, :] * stride_y_d,
+        tl.cast(b_y, dtype=y.dtype.element_ty, fp_downcast_rounding='rtne'),
+        mask=m_t[:, None] & m_d[None, :],
+    )
+
+
+def _launch_fwd_core_scalar(
     x: torch.Tensor,
     weight: torch.Tensor,
     bias: torch.Tensor,
     initial_state: torch.Tensor | None,
     cu_seqlens: torch.LongTensor | None,
-    chunk_indices: torch.LongTensor | None,
+    cu_seqlens_cpu: torch.LongTensor | None,
     B: int,
     T: int,
     D: int,
     W: int,
     BT: int,
-    BD: int | None = None,
 ) -> torch.Tensor:
-    if BD is None:
-        BD, BT = _npu_tile_config(T, BT, D, x.dtype, initial_state)
+    # Scalar-kernel forward (conv only -- no fused activation/residual). Caller applies
+    # activation/residual via _postprocess_fwd. Used for the initial_state path.
+    # Force conservative (small) tiles regardless of dtype: this is the correctness
+    # fallback, and the bf16 big tiles from _npu_tile_config overflow Ascend UB under the
+    # scalar masked-load + multi-buffer pattern. Small tiles always fit; perf is secondary
+    # here (initial_state is the uncommon path; the fast ant_AReaL kernel handles the rest).
+    BD, BT = _npu_tile_config(T, BT, D, torch.float32, initial_state)
+    # Rebuild chunk_indices for the (possibly reduced) BT: the caller built them for a
+    # different BT, and a BT/chunk_indices mismatch corrupts the varlen (n, t) lookup.
+    if cu_seqlens is not None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, BT, cu_seqlens_cpu=cu_seqlens_cpu)
+    else:
+        chunk_indices = None
     NT = len(chunk_indices) if cu_seqlens is not None else triton.cdiv(T, BT)
     BD = _clamp_bd_for_grid(B, NT, D, BD)
     BW = triton.next_power_of_2(W)
@@ -1028,7 +1164,74 @@ def _launch_fwd_core(
         else:
             kernel_kwargs['chunk_indices'] = chunk_indices
             kernel_kwargs['CHUNK_OFFSET'] = nt_off
-        causal_conv1d_fwd_kernel[grid](**kernel_kwargs)
+        causal_conv1d_fwd_kernel_scalar[grid](**kernel_kwargs)
+    return y
+
+
+def _launch_fwd_core(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    residual: torch.Tensor,
+    initial_state: torch.Tensor | None,
+    cu_seqlens: torch.LongTensor | None,
+    chunk_indices: torch.LongTensor | None,
+    B: int,
+    T: int,
+    D: int,
+    W: int,
+    BT: int,
+    activation: str | None = None,
+) -> torch.Tensor:
+    # Ported from ant_AReaL: BD=128 block_ptr + fused bias/silu/residual kernel, with
+    # MAX_NT_PER_BLOCK T-chunks per program to shrink the grid (bf16/fp16). float32 falls
+    # back to a small tile so the fused kernel still fits the 192KB Ascend UB. The NT_GRID
+    # axis is launched in chunks (NT_GRID_OFFSET) so the grid product cdiv(D,BD) x
+    # nt_grid_len x B stays under the 65535 Ascend cap.
+    NT = len(chunk_indices) if cu_seqlens is not None else triton.cdiv(T, BT)
+    BW = triton.next_power_of_2(W)
+    if x.dtype in (torch.bfloat16, torch.float16):
+        BD = 128
+        MAX_NT_PER_BLOCK = 4
+    else:
+        # float32: 4B/elem + the fused residual/silu overflows Ascend UB at BD=128.
+        BD = 16
+        MAX_NT_PER_BLOCK = 1
+    NT_GRID = triton.cdiv(NT, MAX_NT_PER_BLOCK)
+
+    stride_x_n, stride_x_t, stride_x_d = x.stride()
+    y = torch.empty_like(x, memory_format=torch.contiguous_format)
+
+    grid_dim0 = triton.cdiv(D, BD)
+    max_nt_grid = _npu_max_axis_chunks(grid_dim0, B)
+    for nt_grid_off in range(0, NT_GRID, max_nt_grid):
+        nt_grid_len = min(max_nt_grid, NT_GRID - nt_grid_off)
+        grid = (grid_dim0, nt_grid_len, B)
+        causal_conv1d_fwd_kernel[grid](
+            x=x,
+            y=y,
+            weight=weight,
+            bias=bias,
+            residual=residual,
+            cu_seqlens=cu_seqlens,
+            initial_state=initial_state,
+            chunk_indices=chunk_indices,
+            B=B,
+            T=T,
+            D=D,
+            W=W,
+            BT=BT,
+            BW=BW,
+            BD=BD,
+            NT=NT,
+            NT_GRID=NT_GRID,
+            MAX_NT_PER_BLOCK=MAX_NT_PER_BLOCK,
+            NT_GRID_OFFSET=nt_grid_off,
+            ACTIVATION=activation,
+            stride_x_n=stride_x_n,
+            stride_x_t=stride_x_t,
+            stride_x_d=stride_x_d,
+        )
     return y
 
 
@@ -1054,14 +1257,23 @@ def causal_conv1d_fwd_npu(
     B, T, D = x.shape[0], x.shape[1], weight.shape[0]
     W = weight.shape[1]
 
-    BD, BT = _npu_tile_config(T, BT, D, x.dtype, initial_state)
     if cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT, cu_seqlens_cpu=cu_seqlens_cpu)
 
-    y = _launch_fwd_core(
-        x, weight, bias, initial_state, cu_seqlens, chunk_indices, B, T, D, W, BT, BD,
-    )
-    y = _postprocess_fwd(y, residual, activation)
+    if initial_state is None:
+        # ant_AReaL fused block_ptr kernel (fast): bias/silu/residual fused in.
+        y = _launch_fwd_core(
+            x, weight, bias, residual, initial_state, cu_seqlens, chunk_indices,
+            B, T, D, W, BT, activation,
+        )
+    else:
+        # initial_state present: the ant_AReaL kernel's head-edge branch faults the Ascend
+        # vector core on this triton-ascend version, so use the scalar kernel (conv only)
+        # and apply activation/residual afterwards.
+        y = _launch_fwd_core_scalar(
+            x, weight, bias, initial_state, cu_seqlens, cu_seqlens_cpu, B, T, D, W, BT,
+        )
+        y = _postprocess_fwd(y, residual, activation)
 
     final_state = None
     if output_final_state:
@@ -1105,14 +1317,18 @@ def causal_conv1d_bwd_npu(
 
     y_pre = None
     if activation in ('swish', 'silu'):
-        BD_f, BT_f = _npu_tile_config(T, BT, D, x.dtype, initial_state)
-        chunk_indices_f = None
-        if cu_seqlens is not None:
-            chunk_indices_f = prepare_chunk_indices(cu_seqlens, BT_f, cu_seqlens_cpu=cu_seqlens_cpu)
-        y_pre = _launch_fwd_core(
-            x, weight, bias, initial_state, cu_seqlens, chunk_indices_f,
-            B, T, D, W, BT_f, BD_f,
-        )
+        if initial_state is None:
+            chunk_indices_f = None
+            if cu_seqlens is not None:
+                chunk_indices_f = prepare_chunk_indices(cu_seqlens, BT, cu_seqlens_cpu=cu_seqlens_cpu)
+            y_pre = _launch_fwd_core(
+                x, weight, bias, None, initial_state, cu_seqlens, chunk_indices_f,
+                B, T, D, W, BT, activation=None,
+            )
+        else:
+            y_pre = _launch_fwd_core_scalar(
+                x, weight, bias, initial_state, cu_seqlens, cu_seqlens_cpu, B, T, D, W, BT,
+            )
         dy_conv = _launch_silu_bwd(y_pre, dy)
 
     use_seq = _use_seq_bwd(T, x.dtype, initial_state, dht, cu_seqlens)
