@@ -313,54 +313,36 @@ def _silu_bwd_kernel(
     y_ptr,
     dy_ptr,
     out_ptr,
-    stride_y_n,
-    stride_y_t,
-    stride_y_d,
-    stride_dy_n,
-    stride_dy_t,
-    stride_dy_d,
-    stride_out_n,
-    stride_out_t,
-    stride_out_d,
-    B,
-    T,
-    D,
+    n_elements,
     ELEM_OFFSET: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
+    # Flat contiguous elementwise silu/sigmoid backward. Inputs are [B,T,D] contiguous, so
+    # the element offset IS the tensor offset -- no per-element modulo / strided gather
+    # (the old form was the #1 hotspot: 71% of fwd+bwd on PipeUtilization, dominated by
+    # 4 integer divisions per element on the vector pipe).
     pid = tl.program_id(0)
     offs = pid * BLOCK + tl.arange(0, BLOCK) + ELEM_OFFSET
-    n_elements = B * T * D
     mask = offs < n_elements
-    rem = offs % D
-    d = rem
-    rem = (offs - d) // D
-    t = rem % T
-    b = rem // T
-    y_off = b * stride_y_n + t * stride_y_t + d * stride_y_d
-    dy_off = b * stride_dy_n + t * stride_dy_t + d * stride_dy_d
-    out_off = b * stride_out_n + t * stride_out_t + d * stride_out_d
-    y = tl.load(y_ptr + y_off, mask=mask, other=0.).to(tl.float32)
-    dy = tl.load(dy_ptr + dy_off, mask=mask, other=0.).to(tl.float32)
+    y = tl.load(y_ptr + offs, mask=mask, other=0.).to(tl.float32)
+    dy = tl.load(dy_ptr + offs, mask=mask, other=0.).to(tl.float32)
     s = tl.sigmoid(y)
     out = dy * s * (1.0 + y * (1.0 - s))
-    tl.store(out_ptr + out_off, out.to(out_ptr.dtype.element_ty), mask=mask)
+    tl.store(out_ptr + offs, out.to(out_ptr.dtype.element_ty), mask=mask)
 
 
 def _launch_silu_bwd(y_pre: torch.Tensor, dy: torch.Tensor) -> torch.Tensor:
+    # Flat indexing requires contiguous inputs; conv output (y_pre) is contiguous, dy may
+    # arrive non-contiguous from upstream -- make it contiguous (no-op copy if already so).
+    if not y_pre.is_contiguous():
+        y_pre = y_pre.contiguous()
+    if not dy.is_contiguous():
+        dy = dy.contiguous()
     out = torch.zeros_like(dy, memory_format=torch.contiguous_format)
-    B, T, D = dy.shape
-    n = B * T * D
-    sy_n, sy_t, sy_d = y_pre.stride()
-    sdy_n, sdy_t, sdy_d = dy.stride()
-    so_n, so_t, so_d = out.stride()
+    n = dy.numel()
     for grid, elem_off in _elementwise_launch_iters(n):
         _silu_bwd_kernel[(grid,)](
-            y_pre, dy, out,
-            sy_n, sy_t, sy_d,
-            sdy_n, sdy_t, sdy_d,
-            so_n, so_t, so_d,
-            B, T, D,
+            y_pre, dy, out, n,
             ELEM_OFFSET=elem_off,
             BLOCK=_ELEM_BLOCK,
         )
@@ -747,8 +729,11 @@ def _launch_bwd_dwdb_core(
     bias: torch.Tensor | None = None,
 ):
     # dw/db-only kernel (reads x AND dy, so it hits the MLIR/multi-buffer UB cliff before
-    # dx-only): BT=64, BD<=16 (BT*BD<=1024). Don't _clamp_bd_for_grid (raising BD crashes
-    # it; the launch loop handles large grids instead).
+    # dx-only). Empirically the tile is capped at BT*BD<=1024 (BT=64, BD<=16): profiling
+    # showed it Vector-bound (aiv_vec_ratio ~0.91), but BOTH raising BT->128 and BD->32
+    # overflow Ascend UB at compile time (the static_range(W) loop + multi-buffer keep a
+    # large fp32 live set). So tile tuning is a dead end here; the launch loop handles
+    # large grids. Don't _clamp_bd_for_grid (raising BD crashes it).
     if BD is None:
         pow2_t = triton.next_power_of_2(T)
         floor_t = pow2_t if pow2_t == T else pow2_t // 2
